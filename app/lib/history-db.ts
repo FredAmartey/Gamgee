@@ -44,13 +44,6 @@ export type KitRecord = {
 };
 
 const DB_NAME = "gamgee";
-/**
- * Names this database has had before, newest first. Logos saved under an old
- * name are still on the user's device, and a rename that silently stopped
- * reading them would look exactly like losing your whole history, so the first
- * open copies them across. See `migrateLegacyDb`.
- */
-const LEGACY_DB_NAMES = ["gimlee", "logocreator"];
 const STORE = "logos";
 const KIT_STORE = "kits";
 // Kits are heavy (every asset is a Blob), so keep only the most recent few; the
@@ -67,71 +60,6 @@ function available(): boolean {
 // concurrently for nothing. The browser closes it with the page; if another
 // tab upgrades the schema (versionchange) we close and reopen on next use.
 let dbPromise: Promise<IDBDatabase> | null = null;
-
-/**
- * Copy a pre-rename database into the new one, once.
- *
- * Only runs when the new database is genuinely empty, so it can never overwrite
- * newer work, and it re-runs harmlessly if it was interrupted. Anything that
- * goes wrong here is swallowed: failing to find old logos is a disappointment,
- * but failing to OPEN the app because of it would be a bug.
- */
-async function migrateLegacyDb(db: IDBDatabase): Promise<void> {
-  try {
-    const empty = await new Promise<boolean>((resolve) => {
-      const req = db.transaction(STORE, "readonly").objectStore(STORE).count();
-      req.onsuccess = () => resolve(req.result === 0);
-      req.onerror = () => resolve(false);
-    });
-    if (!empty) return;
-
-    // `databases()` is not in Safari, so treat an unlistable set as "try them
-    // all". Opening a name that was never used just creates an empty database,
-    // which costs nothing and reads as no rows to copy.
-    let candidates = LEGACY_DB_NAMES;
-    if (typeof indexedDB.databases === "function") {
-      const present = new Set((await indexedDB.databases()).map((d) => d.name));
-      candidates = LEGACY_DB_NAMES.filter((name) => present.has(name));
-    }
-
-    // Newest name first, and stop at the first one that actually holds logos:
-    // after two renames the older database is a stale snapshot, so copying it
-    // on top would resurrect logos the user already deleted.
-    for (const name of candidates) {
-      const legacy = await new Promise<IDBDatabase | null>((resolve) => {
-        // No version: open whatever exists rather than triggering an upgrade.
-        const req = indexedDB.open(name);
-        req.onsuccess = () => resolve(req.result);
-        req.onerror = () => resolve(null);
-        req.onblocked = () => resolve(null);
-      });
-      if (!legacy) continue;
-      let copied = 0;
-      for (const store of [STORE, KIT_STORE]) {
-        if (!legacy.objectStoreNames.contains(store)) continue;
-        const rows = await new Promise<unknown[]>((resolve) => {
-          const req = legacy.transaction(store, "readonly").objectStore(store).getAll();
-          req.onsuccess = () => resolve(req.result ?? []);
-          req.onerror = () => resolve([]);
-        });
-        if (!rows.length) continue;
-        await new Promise<void>((resolve) => {
-          const t = db.transaction(store, "readwrite");
-          const target = t.objectStore(store);
-          for (const row of rows) target.put(row);
-          t.oncomplete = () => resolve();
-          t.onerror = () => resolve();
-          t.onabort = () => resolve();
-        });
-        if (store === STORE) copied = rows.length;
-      }
-      legacy.close();
-      if (copied) return;
-    }
-  } catch {
-    /* migration is best-effort; never block opening the app */
-  }
-}
 
 function openDb(): Promise<IDBDatabase> {
   if (dbPromise) return dbPromise;
@@ -158,10 +86,7 @@ function openDb(): Promise<IDBDatabase> {
       db.onclose = () => {
         dbPromise = null;
       };
-      // Resolve only after any pre-rename logos have been pulled across, so the
-      // first read of the session cannot race the copy and report an empty
-      // gallery.
-      migrateLegacyDb(db).then(() => resolve(db));
+      resolve(db);
     };
     req.onerror = () => {
       dbPromise = null; // let the next call retry
