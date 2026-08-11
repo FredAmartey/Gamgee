@@ -3,7 +3,7 @@
 ![Gamgee](./public/og-image.png)
 
 Generate a logo, then export the whole brand kit around it. Runs in the browser,
-no account needed.
+just need a together.ai api key.
 
 ## What it does
 
