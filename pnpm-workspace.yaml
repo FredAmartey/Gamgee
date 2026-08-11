@@ -1,0 +1,10 @@
+packages:
+  - "."
+onlyBuiltDependencies:
+  - "@clerk/shared"
+  - "sharp"
+allowBuilds:
+  "@clerk/shared": true
+  core-js: false
+  "sharp": true
+  unrs-resolver: false
