@@ -30,15 +30,10 @@ Then open http://localhost:3000.
 
 ## Configuration
 
-| Variable | Required | Purpose |
-| --- | --- | --- |
-| `TOGETHER_API_KEY` | yes | Image generation and reference reading |
-| `UPSTASH_REDIS_REST_URL` | no | Rate limiting and the free-credit ledger |
-| `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` | no | Sign-in |
-| `NEXT_PUBLIC_SITE_URL` | no | Canonical URL and social card host |
-
-Without Upstash and Clerk the app runs account-less, and visitors bring their
-own key.
+Everything else is optional and listed in `.env.example`: Upstash Redis for rate
+limiting and the free-credit ledger, Clerk for sign-in, and `NEXT_PUBLIC_SITE_URL`
+for the canonical URL and social card. Without Upstash and Clerk the app runs
+account-less and visitors bring their own key.
 
 ## Stack
 
