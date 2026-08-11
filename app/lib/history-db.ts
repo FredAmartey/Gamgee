@@ -16,6 +16,19 @@ export type HistoryRecord = {
   blob: Blob;
   favorite?: boolean;
   name?: string; // user-given label, overrides companyName for display
+  /**
+   * The custom folder this logo is filed in, if any. A logo belongs to at most
+   * one: filing is a move, not a tag. Brand grouping is separate and needs no
+   * field here, since it's derived from `companyName` at read time.
+   */
+  folderId?: string;
+};
+
+/** A user-created folder. Membership lives on the logo, as `folderId`. */
+export type FolderRecord = {
+  id: string;
+  name: string;
+  createdAt: number;
 };
 
 /** One built asset inside a saved brand kit (blob + enough to rebuild the tile). */
@@ -46,10 +59,11 @@ export type KitRecord = {
 const DB_NAME = "gamgee";
 const STORE = "logos";
 const KIT_STORE = "kits";
+const FOLDER_STORE = "folders";
 // Kits are heavy (every asset is a Blob), so keep only the most recent few; the
 // createdAt index lets us evict the oldest without loading any blobs.
 const KIT_CAP = 8;
-const VERSION = 2;
+const VERSION = 3;
 
 function available(): boolean {
   return typeof indexedDB !== "undefined";
@@ -75,6 +89,12 @@ function openDb(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(KIT_STORE)) {
         const kits = db.createObjectStore(KIT_STORE, { keyPath: "logoId" });
         kits.createIndex("createdAt", "createdAt");
+      }
+      // v3: custom folders. Purely additive, so an existing database upgrades
+      // in place with every logo and kit untouched.
+      if (!db.objectStoreNames.contains(FOLDER_STORE)) {
+        const folders = db.createObjectStore(FOLDER_STORE, { keyPath: "id" });
+        folders.createIndex("createdAt", "createdAt");
       }
     };
     req.onsuccess = () => {
@@ -145,10 +165,14 @@ export async function getAllLogos(limit = Infinity): Promise<HistoryRecord[]> {
   });
 }
 
-/** Update a stored logo's metadata (favorite / name) without touching its blob. */
+/**
+ * Update a stored logo's metadata (favorite / name / folder) without touching
+ * its blob. A `folderId` of null unfiles the logo, dropping the key entirely
+ * rather than storing a null (so `folderId in rec` stays a reliable test).
+ */
 export async function patchLogo(
   id: string,
-  patch: { favorite?: boolean; name?: string },
+  patch: { favorite?: boolean; name?: string; folderId?: string | null },
 ): Promise<void> {
   if (!available()) return;
   const db = await openDb();
@@ -159,7 +183,9 @@ export async function patchLogo(
     getReq.onsuccess = () => {
       const rec = getReq.result as HistoryRecord | undefined;
       if (rec) {
-        store.put({ ...rec, ...patch });
+        const next = { ...rec, ...patch } as HistoryRecord;
+        if (patch.folderId === null) delete next.folderId;
+        store.put(next);
       } else {
         // Reject rather than silently no-op so the caller can surface that a
         // favorite/rename didn't persist (instead of it vanishing on reload).
@@ -182,6 +208,69 @@ export async function clearLogos(): Promise<void> {
   if (!available()) return;
   const db = await openDb();
   await tx(db, "readwrite", (s) => s.clear());
+}
+
+// ── Folders ─────────────────────────────────────────────────────────────────
+
+/** Create or rename a folder (same call: the record is keyed by id). */
+export async function saveFolder(rec: FolderRecord): Promise<void> {
+  if (!available()) return;
+  const db = await openDb();
+  await tx(db, "readwrite", (s) => s.put(rec), FOLDER_STORE);
+}
+
+/** Every folder, oldest-first, so the rail order matches creation order. */
+export async function getAllFolders(): Promise<FolderRecord[]> {
+  if (!available()) return [];
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const req = db
+      .transaction(FOLDER_STORE, "readonly")
+      .objectStore(FOLDER_STORE)
+      .index("createdAt")
+      .getAll();
+    req.onsuccess = () => resolve((req.result ?? []) as FolderRecord[]);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+/**
+ * Delete a folder and unfile its logos. Deliberately never deletes the logos
+ * themselves: a folder is a view onto them, and losing artwork to a tidy-up
+ * would be unforgivable. Both stores move in ONE transaction, so a failure
+ * can't leave logos pointing at a folder that no longer exists.
+ */
+export async function deleteFolder(id: string): Promise<void> {
+  if (!available()) return;
+  const db = await openDb();
+  await new Promise<void>((resolve, reject) => {
+    const t = db.transaction([STORE, FOLDER_STORE], "readwrite");
+    t.objectStore(FOLDER_STORE).delete(id);
+    // Walk the logos rather than index on folderId: histories are small (a few
+    // hundred rows at most) and this keeps the schema free of an index that
+    // would need its own migration.
+    const cursorReq = t.objectStore(STORE).openCursor();
+    cursorReq.onsuccess = () => {
+      const cursor = cursorReq.result;
+      if (!cursor) return;
+      const rec = cursor.value as HistoryRecord;
+      if (rec.folderId === id) {
+        const next = { ...rec };
+        delete next.folderId;
+        cursor.update(next);
+      }
+      cursor.continue();
+    };
+    t.oncomplete = () => resolve();
+    t.onerror = () => reject(t.error);
+    t.onabort = () => reject(t.error);
+  });
+}
+
+export async function clearFolders(): Promise<void> {
+  if (!available()) return;
+  const db = await openDb();
+  await tx(db, "readwrite", (s) => s.clear(), FOLDER_STORE);
 }
 
 // ── Brand kits ──────────────────────────────────────────────────────────────

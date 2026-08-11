@@ -6,6 +6,7 @@ import { AnimatePresence, motion } from "framer-motion";
 import {
   Download,
   FileCode2,
+  FolderOpen,
   ImageOff,
   Package,
   RefreshCw,
@@ -44,6 +45,8 @@ export type Generation = {
   createdAt?: number;
   favorite?: boolean;
   name?: string; // user-given label, overrides companyName for display
+  /** The custom folder this logo is filed in, if any (at most one). */
+  folderId?: string;
   /** Hydrated from on-device history (skips the new-logo entry animation). */
   restored?: boolean;
 };
@@ -311,6 +314,8 @@ export default function Gallery({
   generations,
   pendingCount,
   savedKitIds,
+  filterLabel,
+  onClearFilter,
   onVary,
   onOpen,
   onCreateBrandKit,
@@ -320,6 +325,9 @@ export default function Gallery({
   generations: Generation[];
   pendingCount: number;
   savedKitIds: Set<string>;
+  /** Set when the grid is narrowed to a folder or brand (drives the empty state). */
+  filterLabel?: string;
+  onClearFilter?: () => void;
   onVary: (gen: Generation) => void;
   onOpen: (gen: Generation) => void;
   onCreateBrandKit: (gen: Generation) => void;
@@ -327,6 +335,31 @@ export default function Gallery({
   onDelete: (id: string) => void;
 }) {
   if (generations.length === 0 && pendingCount === 0) {
+    // An empty FILTERED grid is a different situation from an empty app, and
+    // the first-run copy there ("your logos will appear here") reads as if the
+    // logos were lost. Name the filter and offer the way back out.
+    if (filterLabel) {
+      return (
+        <div className="flex h-full min-h-[16rem] flex-col items-center justify-center px-8 py-16 text-center">
+          <FolderOpen className="size-10 text-muted-foreground/40" />
+          <h2 className="mt-4 text-base font-bold text-foreground">
+            Nothing in {filterLabel} yet
+          </h2>
+          <p className="mt-1.5 max-w-xs text-pretty text-sm text-muted-foreground">
+            Generate with this selected, or move logos in from your history.
+          </p>
+          {onClearFilter && (
+            <button
+              type="button"
+              onClick={onClearFilter}
+              className="mt-4 rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-foreground outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              Show all logos
+            </button>
+          )}
+        </div>
+      );
+    }
     return (
       <div className="flex h-full min-h-[16rem] flex-col items-center justify-center px-8 py-16 text-center">
         <LogoMark className="animate-pulse-soft size-12 opacity-25" />

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { MotionConfig } from "framer-motion";
 import {
   AlertTriangle,
@@ -62,7 +62,22 @@ import {
   deleteLogo,
   clearLogos,
   patchLogo,
+  saveFolder,
+  getAllFolders,
+  deleteFolder,
+  clearFolders,
+  type FolderRecord,
 } from "./lib/history-db";
+import FolderChips from "./components/FolderChips";
+import {
+  applyFilter,
+  brandGroups,
+  filterIsLive,
+  filterLabel,
+  folderCounts,
+  matchesFilter,
+  type Filter,
+} from "./lib/folders";
 import { FREE_CREDITS } from "./lib/credits";
 
 // Image edits run through Together's image-edit model, which is occasionally
@@ -305,6 +320,12 @@ export default function Page() {
 
   // On-device logo history (IndexedDB).
   const [historyOpen, setHistoryOpen] = useState(false);
+  // Custom folders, plus the two independent selections they drive. The history
+  // panel and the gallery keep separate filters on purpose: browsing folders in
+  // the modal shouldn't silently re-filter the page behind it.
+  const [folders, setFolders] = useState<FolderRecord[]>([]);
+  const [galleryFilter, setGalleryFilter] = useState<Filter>({ kind: "all" });
+  const [historyFilter, setHistoryFilter] = useState<Filter>({ kind: "all" });
   const historyLoadedRef = useRef(false);
   const quotaWarnedRef = useRef(false); // warn once if on-device storage fills
   const refReqRef = useRef(0); // cancels a stale reference-read response
@@ -372,6 +393,9 @@ export default function Page() {
       // Hydrate everything: blobs are ~40KB JPEGs, so even hundreds of logos
       // cost only a few MB. A visible-window cap here silently hides older
       // logos after a reload, which reads as data loss.
+      getAllFolders()
+        .then(setFolders)
+        .catch(() => {});
       getAllLogos()
         .then((recs) => {
           if (!recs.length) return;
@@ -383,6 +407,7 @@ export default function Page() {
             createdAt: r.createdAt,
             favorite: r.favorite,
             name: r.name,
+            folderId: r.folderId,
             restored: true,
           }));
           // Merge by id (a logo generated before restore finished may already
@@ -513,14 +538,20 @@ export default function Page() {
         ).blob();
         const image = URL.createObjectURL(blob);
         const createdAt = Date.now();
+        // Generating while a folder is selected files the result there: that's
+        // what "working inside a folder" should mean, and it saves a move.
+        const folderId =
+          galleryFilter.kind === "folder" ? galleryFilter.id : undefined;
         const next: Generation = {
           id,
           image,
           companyName: params.companyName,
           params,
           createdAt,
+          folderId,
         };
         setGenerations((prev) => [next, ...prev]);
+        revealNewLogo(next);
         // Each successful image costs one credit (charged on landing, so a
         // failed variation never burns one). Account-less mode charges the
         // local counter; with auth on the server ledger already spent it and
@@ -532,6 +563,7 @@ export default function Page() {
           params,
           createdAt,
           blob,
+          folderId,
         }).catch(onPersistError);
         savePromises.current.set(id, savePromise);
         return {
@@ -723,14 +755,19 @@ export default function Page() {
         companyName: gen.companyName,
         params,
         createdAt,
+        // An edit is a new take on the same logo, so it lands in the same
+        // folder rather than falling out of it.
+        folderId: gen.folderId,
       };
       setGenerations((prev) => [next, ...prev]);
+      revealNewLogo(next);
       const savePromise = saveLogo({
         id,
         companyName: gen.companyName,
         params,
         createdAt,
         blob,
+        folderId: gen.folderId,
       }).catch(onPersistError);
       savePromises.current.set(id, savePromise);
       // An edit costs a credit like a generation. Account-less mode charges
@@ -910,6 +947,64 @@ export default function Page() {
     updateGen(gen.id, { name: trimmed || undefined });
     await savePromises.current.get(gen.id);
     patchLogo(gen.id, { name: trimmed }).catch(onPersistError);
+  }
+
+  // ── Folders ───────────────────────────────────────────────────────────────
+
+  /**
+   * Create a folder and return its id straight away (the write to IndexedDB
+   * runs behind it), so the caller can file a logo into the new folder in the
+   * same gesture instead of waiting on a round trip.
+   */
+  function createFolder(name: string): string {
+    const rec: FolderRecord = { id: newId(), name, createdAt: Date.now() };
+    setFolders((prev) => [...prev, rec]);
+    saveFolder(rec).catch(onPersistError);
+    return rec.id;
+  }
+
+  function renameFolder(id: string, name: string) {
+    const rec = folders.find((f) => f.id === id);
+    if (!rec) return;
+    setFolders((prev) => prev.map((f) => (f.id === id ? { ...f, name } : f)));
+    saveFolder({ ...rec, name }).catch(onPersistError);
+  }
+
+  // Deleting a folder never deletes logos: they're unfiled and stay in history.
+  function removeFolder(id: string) {
+    const gone = folders.find((f) => f.id === id);
+    setFolders((prev) => prev.filter((f) => f.id !== id));
+    setGenerations((prev) =>
+      prev.map((g) => (g.folderId === id ? { ...g, folderId: undefined } : g)),
+    );
+    setActiveGen((cur) =>
+      cur && cur.folderId === id ? { ...cur, folderId: undefined } : cur,
+    );
+    deleteFolder(id).catch(onPersistError);
+    toast({
+      title: gone ? `"${gone.name}" deleted` : "Folder deleted",
+      description: "The logos that were in it are still in your history.",
+    });
+  }
+
+  async function moveToFolder(id: string, folderId: string | null) {
+    updateGen(id, { folderId: folderId ?? undefined });
+    const target = folderId ? folders.find((f) => f.id === folderId) : null;
+    // Filing is invisible on the tile itself, so say where it went.
+    toast({
+      title: target ? `Moved to "${target.name}"` : "Removed from folder",
+    });
+    await savePromises.current.get(id);
+    patchLogo(id, { folderId }).catch(onPersistError);
+  }
+
+  /**
+   * Keep a brand-new logo visible. Landing it under a filter it doesn't match
+   * would swallow it on arrival, which reads as a generation that failed, so
+   * the gallery falls back to showing everything.
+   */
+  function revealNewLogo(gen: Generation) {
+    setGalleryFilter((f) => (matchesFilter(gen, f) ? f : { kind: "all" }));
   }
 
   async function handleReferenceFile(file: File) {
@@ -1139,6 +1234,12 @@ export default function Page() {
     });
     setGenerations([]);
     clearLogos().catch(() => {});
+    // Folders go with the logos: keeping a rail of empty folders after a
+    // "clear all" isn't the clean slate the button promises.
+    setFolders([]);
+    clearFolders().catch(() => {});
+    setGalleryFilter({ kind: "all" });
+    setHistoryFilter({ kind: "all" });
     brandKit.clearAllKits();
     toast({
       title: "History cleared",
@@ -1177,6 +1278,29 @@ export default function Page() {
     // dismissWelcome is stable in practice (setState + localStorage).
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [auth.isSignedIn, auth.remaining, welcomeOpen]);
+
+  // Folder/brand views. Brands are derived from the company name on each logo,
+  // so this is the whole of their bookkeeping: no store, no migration, and
+  // every logo saved before folders existed is grouped from the first render.
+  // Memoized because the stale-selection effect below depends on them: fresh
+  // arrays every render would re-run it every render for nothing.
+  const brands = useMemo(() => brandGroups(generations), [generations]);
+  const counts = useMemo(() => folderCounts(generations), [generations]);
+  const favCount = generations.filter((g) => g.favorite).length;
+  const visibleGenerations = applyFilter(generations, galleryFilter);
+  const showFilterChips = folders.length > 0 || brands.length > 1;
+
+  // A selection can go stale under the user: a folder gets deleted, a brand's
+  // last logo is deleted, the final favorite is un-starred. Any of those would
+  // otherwise strand them on a permanently empty grid, so fall back to All.
+  useEffect(() => {
+    const live = (f: Filter) =>
+      f.kind === "favorites"
+        ? favCount > 0
+        : filterIsLive(f, folders, brands);
+    if (!live(galleryFilter)) setGalleryFilter({ kind: "all" });
+    if (!live(historyFilter)) setHistoryFilter({ kind: "all" });
+  }, [brands, folders, favCount, galleryFilter, historyFilter]);
 
   const creditCaption = hasOwnKey
     ? variationCount > 1
@@ -1652,10 +1776,31 @@ export default function Page() {
               {generations.length > 0 ? ` (${generations.length})` : ""}
             </h2>
           )}
+          {/* Only worth the row once there's something to narrow to: a lone
+              brand and no folders makes every chip a synonym for "All". */}
+          {showFilterChips && (
+            <div className="sticky top-0 z-10 border-b border-border/60 bg-background/85 px-5 py-2.5 backdrop-blur-sm sm:px-6">
+              <FolderChips
+                filter={galleryFilter}
+                onChange={setGalleryFilter}
+                brands={brands}
+                folders={folders}
+                counts={counts}
+                total={generations.length}
+                favCount={favCount}
+              />
+            </div>
+          )}
           <Gallery
-            generations={generations}
+            generations={visibleGenerations}
             pendingCount={pendingCount}
             savedKitIds={brandKit.savedKitIds}
+            filterLabel={
+              galleryFilter.kind === "all"
+                ? undefined
+                : filterLabel(galleryFilter, folders, brands)
+            }
+            onClearFilter={() => setGalleryFilter({ kind: "all" })}
             onVary={(gen) => runBatch(gen.params, variationCount)}
             onOpen={(gen) => setActiveGen(gen)}
             onCreateBrandKit={handleCreateBrandKit}
@@ -1718,6 +1863,9 @@ export default function Page() {
         onClose={() => setHistoryOpen(false)}
         generations={generations}
         savedKitIds={brandKit.savedKitIds}
+        folders={folders}
+        filter={historyFilter}
+        onFilterChange={setHistoryFilter}
         onOpen={(gen) => {
           setHistoryOpen(false);
           setActiveGen(gen);
@@ -1730,6 +1878,10 @@ export default function Page() {
         onDelete={handleDeleteLogo}
         onClear={handleClearHistory}
         onToggleFavorite={toggleFavorite}
+        onCreateFolder={createFolder}
+        onRenameFolder={renameFolder}
+        onDeleteFolder={removeFolder}
+        onMoveToFolder={moveToFolder}
       />
       <WelcomeModal
         open={welcomeOpen}
